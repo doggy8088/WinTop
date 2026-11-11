@@ -19,16 +19,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Update module version from tag or input
         shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'WinTop/WinTop.psd1'
           $targetVersion = $null
 
-          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ inputs.version }}' -ne '') {
-            $targetVersion = '${{ inputs.version }}'.TrimStart('v')
+          if ($env:EVENT_NAME -eq 'workflow_dispatch' -and -not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION)) {
+            $targetVersion = $env:INPUT_VERSION.Trim().TrimStart('v')
           } elseif ($env:GITHUB_REF_NAME -match '^v(\d+\.\d+\.\d+)$') {
             $targetVersion = $Matches[1]
           }
@@ -69,4 +72,4 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_API_KEY)) {
             throw "Missing PSGALLERY_API_KEY repository secret! Please add PSGALLERY_API_KEY in GitHub Repo -> Settings -> Secrets and variables -> Actions."
           }
-          Publish-Module -Path ./WinTop -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose -Force -ErrorAction Stop
+          Publish-PSResource -Path ./WinTop -Repository PSGallery -ApiKey $env:PSGALLERY_API_KEY -Verbose -ErrorAction Stop
