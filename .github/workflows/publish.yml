@@ -1,0 +1,72 @@
+name: Publish WinTop to PowerShell Gallery
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional module version override (e.g. 0.1.0). Leave blank to use WinTop.psd1 version.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update module version from tag or input
+        shell: pwsh
+        run: |
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'WinTop/WinTop.psd1'
+          $targetVersion = $null
+
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch' -and '${{ inputs.version }}' -ne '') {
+            $targetVersion = '${{ inputs.version }}'.TrimStart('v')
+          } elseif ($env:GITHUB_REF_NAME -match '^v(\d+\.\d+\.\d+)$') {
+            $targetVersion = $Matches[1]
+          }
+
+          if ($targetVersion) {
+            Write-Host "Setting ModuleVersion in WinTop.psd1 to $targetVersion"
+            $content = Get-Content -Path $manifestPath -Raw -Encoding UTF8
+            $content = $content -replace "ModuleVersion\s*=\s*'[^']+'", "ModuleVersion        = '$targetVersion'"
+            [System.IO.File]::WriteAllText($manifestPath, $content, (New-Object System.Text.UTF8Encoding $true))
+          }
+
+      - name: Copy LICENSE and README into module package folder
+        shell: pwsh
+        run: |
+          Copy-Item -Path ./LICENSE -Destination ./WinTop/LICENSE -Force
+          Copy-Item -Path ./README.md -Destination ./WinTop/README.md -Force
+
+      - name: Validate Module Manifest & Smoke Test (pwsh + powershell 5.1)
+        shell: pwsh
+        run: |
+          $manifest = Test-ModuleManifest -Path ./WinTop/WinTop.psd1 -ErrorAction Stop
+          Write-Host "Validated $($manifest.Name) v$($manifest.Version)"
+
+          Import-Module ./WinTop/WinTop.psd1 -Force -ErrorAction Stop
+          Start-WinTop -Count 1 -Language en -NoMaximize
+          Start-WinTop -Count 1 -Language zh-TW -NoMaximize
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            Import-Module ./WinTop/WinTop.psd1 -Force -ErrorAction Stop;
+            top -Count 1 -Language en -NoMaximize
+          "
+
+      - name: Publish to PowerShell Gallery
+        shell: pwsh
+        env:
+          PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PSGALLERY_API_KEY)) {
+            throw "Missing PSGALLERY_API_KEY repository secret! Please add PSGALLERY_API_KEY in GitHub Repo -> Settings -> Secrets and variables -> Actions."
+          }
+          Publish-Module -Path ./WinTop -NuGetApiKey $env:PSGALLERY_API_KEY -Verbose -Force -ErrorAction Stop

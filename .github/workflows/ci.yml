@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Manifest & Smoke Test (PowerShell 7 & Windows PowerShell 5.1)
+        shell: pwsh
+        run: |
+          $manifest = Test-ModuleManifest -Path ./WinTop/WinTop.psd1 -ErrorAction Stop
+          Write-Host "Module: $($manifest.Name) v$($manifest.Version)"
+
+          Import-Module ./WinTop/WinTop.psd1 -Force -ErrorAction Stop
+          top -Count 1 -Language en -NoMaximize
+          top -Count 1 -Language zh-TW -View Processes -SortBy MEM -NoMaximize
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            Import-Module ./WinTop/WinTop.psd1 -Force -ErrorAction Stop;
+            top -Count 1 -Language en -NoMaximize
+          "

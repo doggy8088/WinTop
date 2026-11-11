@@ -1,0 +1,5 @@
+*.nupkg
+out/
+dist/
+.DS_Store
+Thumbs.db
