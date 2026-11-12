@@ -148,6 +148,99 @@ namespace WinTop {
             return list;
         }
     }
+
+    public struct GpuAdapterInfo {
+        public string Name;
+        public string Key;            // lower-case "luid_0x00000000_0x0001097f": matches the GPU performance counter instance names
+        public ulong DedicatedBytes;  // DXGI DedicatedVideoMemory (real VRAM on discrete GPUs, a small carve-out on integrated GPUs)
+        public ulong SharedBytes;     // DXGI SharedSystemMemory
+        public uint VendorId;
+    }
+
+    // Enumerates hardware GPUs through DXGI. Win32_VideoController.AdapterRAM is a uint32 and wraps at 4 GB,
+    // and the performance counters expose usage but not capacity, so DXGI is the only dependable source of total VRAM.
+    public static class GpuHelper {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DXGI_ADAPTER_DESC1 {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string Description;
+            public uint VendorId;
+            public uint DeviceId;
+            public uint SubSysId;
+            public uint Revision;
+            public UIntPtr DedicatedVideoMemory;
+            public UIntPtr DedicatedSystemMemory;
+            public UIntPtr SharedSystemMemory;
+            public uint LuidLow;
+            public int LuidHigh;
+            public uint Flags;
+        }
+
+        // COM interop does not flatten base interfaces, so IDXGIObject / IDXGIFactory / IDXGIAdapter slots are repeated in vtable order.
+        [ComImport, Guid("770aae78-f26f-4dba-a829-253c83d1b387"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IDXGIFactory1 {
+            [PreserveSig] int SetPrivateData(ref Guid name, uint dataSize, IntPtr data);
+            [PreserveSig] int SetPrivateDataInterface(ref Guid name, [MarshalAs(UnmanagedType.IUnknown)] object unknown);
+            [PreserveSig] int GetPrivateData(ref Guid name, ref uint dataSize, IntPtr data);
+            [PreserveSig] int GetParent(ref Guid riid, out IntPtr parent);
+            [PreserveSig] int EnumAdapters(uint index, out IntPtr adapter);
+            [PreserveSig] int MakeWindowAssociation(IntPtr hwnd, uint flags);
+            [PreserveSig] int GetWindowAssociation(out IntPtr hwnd);
+            [PreserveSig] int CreateSwapChain(IntPtr device, IntPtr desc, out IntPtr swapChain);
+            [PreserveSig] int CreateSoftwareAdapter(IntPtr module, out IntPtr adapter);
+            [PreserveSig] int EnumAdapters1(uint index, [MarshalAs(UnmanagedType.Interface)] out IDXGIAdapter1 adapter);
+            [PreserveSig] int IsCurrent();
+        }
+
+        [ComImport, Guid("29038f61-3839-4626-91fd-086879011a05"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IDXGIAdapter1 {
+            [PreserveSig] int SetPrivateData(ref Guid name, uint dataSize, IntPtr data);
+            [PreserveSig] int SetPrivateDataInterface(ref Guid name, [MarshalAs(UnmanagedType.IUnknown)] object unknown);
+            [PreserveSig] int GetPrivateData(ref Guid name, ref uint dataSize, IntPtr data);
+            [PreserveSig] int GetParent(ref Guid riid, out IntPtr parent);
+            [PreserveSig] int EnumOutputs(uint index, out IntPtr output);
+            [PreserveSig] int GetDesc(IntPtr desc);
+            [PreserveSig] int CheckInterfaceSupport(ref Guid guid, out long umdVersion);
+            [PreserveSig] int GetDesc1(out DXGI_ADAPTER_DESC1 desc);
+        }
+
+        [DllImport("dxgi.dll")]
+        private static extern int CreateDXGIFactory1(ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out IDXGIFactory1 factory);
+
+        // Returns hardware adapters only (software adapters such as the Basic Render Driver are skipped).
+        // Returns an empty list when DXGI is unavailable (e.g. Server Core).
+        public static List<GpuAdapterInfo> GetAdapters() {
+            var list = new List<GpuAdapterInfo>();
+            IDXGIFactory1 factory = null;
+            try {
+                Guid iid = typeof(IDXGIFactory1).GUID;
+                if (CreateDXGIFactory1(ref iid, out factory) < 0 || factory == null) return list;
+                for (uint i = 0; i < 32; i++) {
+                    IDXGIAdapter1 adapter;
+                    if (factory.EnumAdapters1(i, out adapter) != 0 || adapter == null) break;
+                    try {
+                        DXGI_ADAPTER_DESC1 d;
+                        if (adapter.GetDesc1(out d) < 0) continue;
+                        if ((d.Flags & 2) != 0) continue; // DXGI_ADAPTER_FLAG_SOFTWARE
+                        list.Add(new GpuAdapterInfo {
+                            Name = d.Description,
+                            Key = string.Format("luid_0x{0:x8}_0x{1:x8}", (uint)d.LuidHigh, d.LuidLow),
+                            DedicatedBytes = d.DedicatedVideoMemory.ToUInt64(),
+                            SharedBytes = d.SharedSystemMemory.ToUInt64(),
+                            VendorId = d.VendorId
+                        });
+                    } finally {
+                        Marshal.ReleaseComObject(adapter);
+                    }
+                }
+            } catch (Exception) {
+                // DXGI missing or misbehaving: report whatever was found so far
+            } finally {
+                if (factory != null) Marshal.ReleaseComObject(factory);
+            }
+            return list;
+        }
+    }
 }
 '@ -ErrorAction SilentlyContinue
 }
@@ -184,6 +277,13 @@ function Get-WinTopStrings {
             ViewSplit    = '綜合'
             ViewCharts   = '圖表'
             ViewProcs    = '程序'
+            GpuLbl       = 'GPU 使用率:'
+            VramLbl      = '顯示記憶體:'
+            ChartGpu     = 'GPU 使用率 (%)'
+            ChartVram    = '顯示記憶體使用率 (%)'
+            VramKind     = '專用'
+            VramKindUma  = '共用'
+            HotkeyGpu    = '  [G]切換GPU'
         }
     } else {
         return @{
@@ -215,6 +315,13 @@ function Get-WinTopStrings {
             ViewSplit    = 'Split'
             ViewCharts   = 'Charts'
             ViewProcs    = 'Procs'
+            GpuLbl       = 'GPU Usage :'
+            VramLbl      = 'VRAM Usage:'
+            ChartGpu     = 'GPU Usage (%)'
+            ChartVram    = 'VRAM Usage (%)'
+            VramKind     = 'VRAM'
+            VramKindUma  = 'shared'
+            HotkeyGpu    = '  [G]GPU'
         }
     }
 }
@@ -236,13 +343,155 @@ function Get-DisplayWidth {
     return $w
 }
 
+# GPU telemetry uses the vendor-neutral WDDM performance counters (NVIDIA / AMD / Intel, Windows 10 1709+), the same
+# source Task Manager reads: "GPU Engine" (per process+engine utilization) and "GPU Adapter Memory" (VRAM usage).
+
+# "pid_1234_luid_0x00000000_0x0001097f_phys_0_eng_3_engtype_3d" -> Adapter 'luid_0x00000000_0x0001097f' + a per-engine key.
+# Returns $null for names that do not look like GPU engine instances.
+function ConvertFrom-WinTopGpuEngineName {
+    param([string]$Name)
+    if ($Name -match 'luid_(0x[0-9a-f]+_0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_') {
+        $adapter = "luid_$($Matches[1].ToLowerInvariant())"
+        return [PSCustomObject]@{ Adapter = $adapter; Engine = "${adapter}_phys$($Matches[2])_eng$($Matches[3])" }
+    }
+    return $null
+}
+
+# $Utilization maps GPU Engine instance name -> % of one engine used by one process. Like Task Manager, sum the
+# processes sharing an engine, then report each adapter's busiest engine. Returns adapter key -> percent (0..100).
+# $MetaCache memoizes parsed instance names (a $false entry means "not a GPU engine name").
+function Measure-WinTopGpuUtil {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Utilization,
+        [Parameter(Mandatory)][hashtable]$MetaCache
+    )
+    if ($MetaCache.Count -gt 5000) { $MetaCache.Clear() }   # PIDs churn; keep the cache bounded
+    $engineSum = @{}
+    $engineAdapter = @{}
+    foreach ($name in $Utilization.Keys) {
+        $meta = $MetaCache[$name]
+        if ($null -eq $meta) {
+            $meta = ConvertFrom-WinTopGpuEngineName -Name $name
+            if ($null -eq $meta) { $meta = $false }
+            $MetaCache[$name] = $meta
+        }
+        if ($meta -is [bool]) { continue }
+        $engineSum[$meta.Engine] = [double]$engineSum[$meta.Engine] + [double]$Utilization[$name]
+        $engineAdapter[$meta.Engine] = $meta.Adapter
+    }
+    $result = @{}
+    foreach ($engine in $engineSum.Keys) {
+        $adapter = $engineAdapter[$engine]
+        $v = [math]::Min(100.0, $engineSum[$engine])
+        if (-not $result.ContainsKey($adapter) -or $result[$adapter] -lt $v) { $result[$adapter] = $v }
+    }
+    return $result
+}
+
+# Reads the "GPU Engine" category once and converts the cumulative 100ns busy-time samples to percentages against the
+# samples kept in $State.Prev (updated here). Instances whose raw value did not move are idle and skipped cheaply.
+function Get-WinTopGpuUtilization {
+    param(
+        [Parameter(Mandatory)]$Category,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+    $instances = $Category.ReadCategory()['Utilization Percentage']
+    $next = @{}
+    $active = @{}
+    if ($instances) {
+        foreach ($d in $instances.Values) {
+            $name = $d.InstanceName
+            $cur  = $d.Sample
+            $next[$name] = $cur
+            $prev = $State.Prev[$name]
+            if ($null -eq $prev -or $cur.RawValue -eq $prev.RawValue) { continue }
+            $v = [System.Diagnostics.CounterSample]::Calculate($prev, $cur)
+            if ($v -gt 0) { $active[$name] = $v }
+        }
+    }
+    $State.Prev = $next
+    return (Measure-WinTopGpuUtil -Utilization $active -MetaCache $State.Meta)
+}
+
+# "GPU Adapter Memory" usage in bytes, summed over the physical nodes of each adapter: @{ Dedicated = @{key=bytes}; Shared = @{key=bytes} }
+function Get-WinTopGpuMemory {
+    param([Parameter(Mandatory)]$Category)
+    $data = $Category.ReadCategory()
+    $dedicated = @{}
+    $shared = @{}
+    foreach ($pair in @(@('Dedicated Usage', $dedicated), @('Shared Usage', $shared))) {
+        $col = $data[$pair[0]]
+        if (-not $col) { continue }
+        foreach ($d in $col.Values) {
+            $key = $d.InstanceName.ToLowerInvariant() -replace '_phys_\d+$', ''
+            $pair[1][$key] = [double]$pair[1][$key] + [double]$d.Sample.RawValue
+        }
+    }
+    return @{ Dedicated = $dedicated; Shared = $shared }
+}
+
+# Hardware GPUs sorted discrete-first (largest dedicated memory first). Integrated GPUs (little dedicated memory) use
+# system RAM, so for those the "VRAM" figure is dedicated + shared. Names/capacity come from DXGI; if DXGI is
+# unavailable the adapters seen in the counters are listed as "GPU n" with unknown (0) capacity.
+function Get-WinTopGpuAdapterList {
+    param([Parameter(Mandatory)]$MemoryCategory)
+    $counterKeys = @{}
+    foreach ($n in $MemoryCategory.GetInstanceNames()) {
+        $counterKeys[($n.ToLowerInvariant() -replace '_phys_\d+$', '')] = $true
+    }
+    $list = New-Object System.Collections.Generic.List[PSCustomObject]
+    $idx = 0
+    foreach ($a in [WinTop.GpuHelper]::GetAdapters()) {
+        if ($counterKeys.Count -gt 0 -and -not $counterKeys.ContainsKey($a.Key)) { continue }
+        $name = ([string]$a.Name -replace '[\x00-\x1F\x7F]', '' -replace '\s+', ' ').Trim()
+        if (-not $name) { $name = "GPU $idx" }
+        $uma = $a.DedicatedBytes -lt 1GB
+        $list.Add([PSCustomObject]@{
+            Index      = $idx++
+            Name       = $name
+            Key        = $a.Key
+            Uma        = $uma
+            TotalBytes = [double]$(if ($uma) { $a.DedicatedBytes + $a.SharedBytes } else { $a.DedicatedBytes })
+        })
+    }
+    if ($list.Count -eq 0) {
+        foreach ($key in ($counterKeys.Keys | Sort-Object)) {
+            $list.Add([PSCustomObject]@{ Index = $idx; Name = "GPU $idx"; Key = $key; Uma = $false; TotalBytes = 0.0 })
+            $idx++
+        }
+    }
+    return @($list | Sort-Object @{ Expression = { $_.Uma } }, @{ Expression = { $_.TotalBytes }; Descending = $true }, Index)
+}
+
+# One sample for every adapter: adapter key -> @{ Util (%), UsedBytes, TotalBytes, VramPct (%) }
+function Get-WinTopGpuSnapshot {
+    param(
+        [Parameter(Mandatory)]$Adapters,
+        [Parameter(Mandatory)]$EngineCategory,
+        [Parameter(Mandatory)]$MemoryCategory,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+    $util = Get-WinTopGpuUtilization -Category $EngineCategory -State $State
+    $mem  = Get-WinTopGpuMemory -Category $MemoryCategory
+    $snapshot = @{}
+    foreach ($a in $Adapters) {
+        $u  = if ($util.ContainsKey($a.Key)) { [double]$util[$a.Key] } else { 0.0 }
+        $ded = [double]$mem.Dedicated[$a.Key]
+        $shr = [double]$mem.Shared[$a.Key]
+        $used = if ($a.Uma) { $ded + $shr } else { $ded }
+        $pct  = if ($a.TotalBytes -gt 0) { [math]::Max(0.0, [math]::Min(100.0, $used / $a.TotalBytes * 100.0)) } else { 0.0 }
+        $snapshot[$a.Key] = [PSCustomObject]@{ Util = $u; UsedBytes = $used; TotalBytes = $a.TotalBytes; VramPct = $pct }
+    }
+    return $snapshot
+}
+
 <#
 .SYNOPSIS
     Interactive full-screen TUI system & CPU monitor ("top" for Windows) with 5-minute trend charts, thermal telemetry, memory usage, and live top processes.
 
 .DESCRIPTION
     Start-WinTop (aliased to `top` and `wintop`) displays a flicker-free, responsive Terminal User Interface (TUI) on Windows.
-    It monitors real-time CPU utility, clock frequency (including Turbo Boost), system memory, ACPI thermal zone temperature, passive thermal throttling limits, 5-minute historical multi-row charts, and top resource-consuming processes.
+    It monitors real-time CPU utility, clock frequency (including Turbo Boost), system memory, ACPI thermal zone temperature, passive thermal throttling limits, GPU utilization and dedicated VRAM (any vendor, via the WDDM performance counters; press G to switch between multiple GPUs), 5-minute historical multi-row charts, and top resource-consuming processes.
 
 .PARAMETER Interval
     Refresh interval in seconds (default: 1.0). Hotkeys remain responsive (<50ms) regardless of Interval.
@@ -343,6 +592,31 @@ function Start-WinTop {
             }
         }
     } catch {}
+
+    # GPU telemetry: hidden entirely when the WDDM counters or DXGI adapters are unavailable (VMs, old Windows, Server Core)
+    $hasGpu      = $false
+    $gpuEngCat   = $null
+    $gpuMemCat   = $null
+    $gpuAdapters = @()
+    $gpuState    = @{ Prev = @{}; Meta = @{} }
+    $gpuHist     = @{}
+    $gpuNow      = @{}
+    $gpuPrevVals = @{}
+    $gpuDeltas   = @{}
+    $gpuSel      = 0
+    try {
+        if ([System.Diagnostics.PerformanceCounterCategory]::Exists('GPU Engine') -and
+            [System.Diagnostics.PerformanceCounterCategory]::Exists('GPU Adapter Memory')) {
+            $gpuEngCat   = New-Object System.Diagnostics.PerformanceCounterCategory('GPU Engine')
+            $gpuMemCat   = New-Object System.Diagnostics.PerformanceCounterCategory('GPU Adapter Memory')
+            $gpuAdapters = @(Get-WinTopGpuAdapterList -MemoryCategory $gpuMemCat)
+            if ($gpuAdapters.Count -gt 0) {
+                $null = Get-WinTopGpuUtilization -Category $gpuEngCat -State $gpuState   # prime the "previous" samples
+                foreach ($ga in $gpuAdapters) { $gpuHist[$ga.Key] = New-Object System.Collections.Generic.List[PSCustomObject] }
+                $hasGpu = $true
+            }
+        }
+    } catch { $hasGpu = $false }
 
     # Seed initial process snapshot so first frame has valid CPU% delta
     $prevProcMap = @{}
@@ -581,6 +855,16 @@ function Start-WinTop {
             $usedGB   = $usedBytes / 1GB
             $memPct   = if ($memStat.TotalPhysBytes -gt 0) { ($usedBytes / [double]$memStat.TotalPhysBytes) * 100.0 } else { [double]$memStat.MemoryLoadPct }
 
+            # GPU: sampled once per real tick (a hotkey-triggered redraw reuses the previous values)
+            if ($hasGpu -and -not $forceRedraw) {
+                try {
+                    $gpuNow = Get-WinTopGpuSnapshot -Adapters $gpuAdapters -EngineCategory $gpuEngCat -MemoryCategory $gpuMemCat -State $gpuState
+                } catch {
+                    # A transient counter read failure keeps the last known values instead of killing the monitor
+                    Write-Verbose "GPU sampling failed: $($_.Exception.Message)"
+                }
+            }
+
             # 2. Sample Top Processes (<20ms)
             $dtSec = [math]::Max(0.05, $prevProcTime.Elapsed.TotalSeconds)
             $prevProcTime.Restart()
@@ -623,6 +907,23 @@ function Start-WinTop {
                 $cutoff = $now.AddSeconds(-$windowSeconds)
                 while ($history.Count -gt 0 -and $history[0].Timestamp -lt $cutoff) {
                     $history.RemoveAt(0)
+                }
+                if ($hasGpu) {
+                    foreach ($ga in $gpuAdapters) {
+                        $gs = $gpuNow[$ga.Key]
+                        if ($null -eq $gs) { continue }
+                        $gh = $gpuHist[$ga.Key]
+                        $gh.Add([PSCustomObject]@{ Timestamp = $now; Util = $gs.Util; VramPct = $gs.VramPct })
+                        while ($gh.Count -gt 0 -and $gh[0].Timestamp -lt $cutoff) { $gh.RemoveAt(0) }
+                        $gpv = $gpuPrevVals[$ga.Key]
+                        $gpvUtil = if ($gpv) { $gpv.Util } else { 0.0 }
+                        $gpvVram = if ($gpv) { $gpv.VramPct } else { 0.0 }
+                        $gpuDeltas[$ga.Key] = @{
+                            Util = (& $formatDelta $gs.Util $gpvUtil '0.0' '%' ($null -ne $gpv))
+                            Vram = (& $formatDelta $gs.VramPct $gpvVram '0.0' '%' ($null -ne $gpv))
+                        }
+                        $gpuPrevVals[$ga.Key] = @{ Util = $gs.Util; VramPct = $gs.VramPct }
+                    }
                 }
                 $i++
             }
@@ -688,6 +989,28 @@ function Start-WinTop {
             $barMem   = & $newGaugeBar $memPct 0 100 $gaugeWidth $colMem
             $barTemp  = & $newGaugeBar $tempC 30 100 $gaugeWidth $colTemp
 
+            # Selected GPU (G cycles through adapters when there is more than one)
+            $showGpu = $false
+            if ($hasGpu -and $gpuNow.ContainsKey($gpuAdapters[$gpuSel].Key) -and $gpuDeltas.ContainsKey($gpuAdapters[$gpuSel].Key)) {
+                $showGpu  = $true
+                $gAd      = $gpuAdapters[$gpuSel]
+                $gNow     = $gpuNow[$gAd.Key]
+                $gHist    = $gpuHist[$gAd.Key]
+                $colGpu   = & $getMetricColor $gNow.Util 60 85 $false
+                $colVram  = & $getMetricColor $gNow.VramPct 70 88 $false
+                $dltGpu   = $gpuDeltas[$gAd.Key].Util
+                $dltVram  = $gpuDeltas[$gAd.Key].Vram
+                $stsGpu   = & $getStatsText ($gHist | ForEach-Object { $_.Util }) '0.0' '%'
+                $stsVram  = & $getStatsText ($gHist | ForEach-Object { $_.VramPct }) '0.0' '%'
+                $barGpu   = & $newGaugeBar $gNow.Util 0 100 $gaugeWidth $colGpu
+                $barVram  = & $newGaugeBar $gNow.VramPct 0 100 $gaugeWidth $colVram
+                $padGU    = [string]::new(' ', [math]::Max(1, 10 - $dltGpu.Width))
+                $padGV    = [string]::new(' ', [math]::Max(1, 10 - $dltVram.Width))
+                $vramTag  = if ($gNow.TotalBytes -gt 0) { "{0,4:N1}/{1:N0}G" -f ($gNow.UsedBytes / 1GB), ($gNow.TotalBytes / 1GB) } else { 'N/A' }
+                $vramCap  = if ($gNow.TotalBytes -ge 1GB) { "{0:N0}G" -f ($gNow.TotalBytes / 1GB) } elseif ($gNow.TotalBytes -gt 0) { "{0:N0}M" -f ($gNow.TotalBytes / 1MB) } else { 'N/A' }
+                $vramKind = if ($gAd.Uma) { $ui.VramKindUma } else { $ui.VramKind }
+            }
+
             $prevUsage = $usage; $prevMHz = $mhz; $prevMemPct = $memPct; $prevTemp = $tempC
             $hasPrev = $true
 
@@ -706,7 +1029,12 @@ function Start-WinTop {
 
             $hdr1 = " ${cWhite}${cBold}$($ui.Title)${cReset}  ${cGray}$($ui.Time):${cReset} ${cWhite}${nowStr}${cReset} ${cGray}| $($ui.Sample):${cReset} ${cWhite}#${i}${cReset} ${cGray}| $($ui.Window):${cReset} ${cWhite}${elapsedSec}s/${windowSeconds}s${cReset} ${cGray}| [${viewLabel}] ${termWidth}x${termHeight}${cReset}"
             $hdr2 = " ${cGray}$($ui.CPU):${cReset} ${cWhite}${cpuName} ($($ui.BaseClock) ${baseMHz} MHz, ${numCores}$($ui.Cores)/${numThreads}$($ui.Threads))${cReset}"
-            foreach ($hLine in @($hdr1, $hdr2)) {
+            $hdrLines = @($hdr1, $hdr2)
+            if ($showGpu) {
+                $gpuMulti = if ($gpuAdapters.Count -gt 1) { "  ${cGray}[$($gpuSel + 1)/$($gpuAdapters.Count)]${cReset}" } else { '' }
+                $hdrLines += " ${cGray}GPU:${cReset} ${cWhite}$($gAd.Name) (${vramCap} ${vramKind})${cReset}${gpuMulti}"
+            }
+            foreach ($hLine in $hdrLines) {
                 $visW = Get-DisplayWidth -Text $hLine
                 $pad  = [string]::new(' ', [math]::Max(0, $innerWidth - $visW))
                 [void]$out.AppendLine("${cCyan}${cBold}${boxV}${cReset}${hLine}${pad}${cCyan}${cBold}${boxV}${cReset}${clr}")
@@ -728,10 +1056,14 @@ function Start-WinTop {
                 $throtBadge = if ($limit -lt 100) { "${cRed}$($ui.ThrottleTag)${cReset}" } else { "${cGreen}$($ui.NormalTag)${cReset}" }
                 [void]$out.AppendLine((" ${cBold}$($ui.TempLbl)${cReset} ${colTemp}${cBold}{0,5:N1} {1}${cReset} {2} [{3}] {4}{5}${cGray}({6})${cReset}${clr}" -f $tempC, $degC, $throtBadge, $barTemp, $dltTemp.Text, $padT, $stsTemp))
             }
+            if ($showGpu) {
+                [void]$out.AppendLine((" ${cBold}$($ui.GpuLbl)${cReset} ${colGpu}${cBold}{0,6:N1}%${cReset}          [{1}] {2}{3}${cGray}({4})${cReset}${clr}" -f $gNow.Util, $barGpu, $dltGpu.Text, $padGU, $stsGpu))
+                [void]$out.AppendLine((" ${cBold}$($ui.VramLbl)${cReset} ${colVram}${cBold}{0,6:N1}%${cReset} {1,8} [{2}] {3}{4}${cGray}({5})${cReset}${clr}" -f $gNow.VramPct, $vramTag, $barVram, $dltVram.Text, $padGV, $stsVram))
+            }
             [void]$out.AppendLine("${cGray} ${hr}${cReset}${clr}")
 
             # Calculate remaining vertical lines (reserve 1 bottom line for Hotkey bar)
-            $usedLines = 4 + $(if ($hasThermal) { 4 } else { 3 }) + 1 + 1
+            $usedLines = 4 + $(if ($hasThermal) { 4 } else { 3 }) + 1 + 1 + $(if ($showGpu) { 3 } else { 0 })
             $bodyLines = [math]::Max(10, $termHeight - $usedLines)
 
             $showCharts = ($View -eq 'Split' -or $View -eq 'Charts')
@@ -759,16 +1091,24 @@ function Start-WinTop {
                 $chartTitle = $ui.ChartSection -f $Minutes, $windowSeconds, $chartWidth, $secPerColStr
                 [void]$out.AppendLine(" ${cBold}${cCyan}[${chartTitle}]${cReset}${clr}")
 
-                $numCharts = if ($hasThermal) { 4 } else { 3 }
+                $numCoreCharts = if ($hasThermal) { 4 } else { 3 }
+                # The two GPU charts always show in the Charts view; in the split view only when every chart still gets >= 2 plot rows
+                $showGpuCharts = $showGpu -and ($View -eq 'Charts' -or $chartBudget -ge (3 + 3 * ($numCoreCharts + 2)))
+                $numCharts = $numCoreCharts + $(if ($showGpuCharts) { 2 } else { 0 })
                 # Overhead inside chart block: 1 section header + $numCharts titles + 2 time axis lines
                 $availPlotRows = [math]::Max($numCharts * 2, $chartBudget - (3 + $numCharts))
                 $baseRows = [math]::Max(2, [int][math]::Floor($availPlotRows / [double]$numCharts))
                 $extraRows = [math]::Max(0, $availPlotRows - ($baseRows * $numCharts))
 
-                $rUsage = $baseRows + $(if ($extraRows -ge 1) { 1 } else { 0 })
-                $rMHz   = $baseRows + $(if ($extraRows -ge 2) { 1 } else { 0 })
-                $rMem   = $baseRows + $(if ($extraRows -ge 3) { 1 } else { 0 })
-                $rTemp  = $baseRows
+                # Leftover rows go to the first charts, in display order
+                $rowList = @(for ($ci = 0; $ci -lt $numCharts; $ci++) { $baseRows + $(if ($ci -lt $extraRows) { 1 } else { 0 }) })
+                $ri = 0
+                $rUsage = $rowList[$ri++]
+                $rMHz   = $rowList[$ri++]
+                $rMem   = $rowList[$ri++]
+                $rTemp  = if ($hasThermal) { $rowList[$ri++] } else { $baseRows }
+                $rGpu   = if ($showGpuCharts) { $rowList[$ri++] } else { 0 }
+                $rVram  = if ($showGpuCharts) { $rowList[$ri++] } else { 0 }
 
                 [void]$out.AppendLine(" ${cBold}1. $($ui.ChartUsage)${cReset}  ${cGray}${stsUsage}${cReset}${clr}")
                 foreach ($ln in (& $newMultiRowChart $bktUsage 0 100 $rUsage '0' '%' { param($v) & $getMetricColor $v 60 85 $false } $clr)) {
@@ -790,6 +1130,22 @@ function Start-WinTop {
                     $tempChartLbl = $ui.ChartTemp -f $degC
                     [void]$out.AppendLine(" ${cBold}4. ${tempChartLbl}${cReset}  ${cGray}${stsTemp} | Limit: ${stsLimit}${cReset}${clr}")
                     foreach ($ln in (& $newMultiRowChart $bktTemp 30 95 $rTemp '0' $degC { param($v) & $getMetricColor $v 70 85 $false } $clr)) {
+                        [void]$out.AppendLine($ln)
+                    }
+                }
+
+                if ($showGpuCharts) {
+                    $gpuChartNo = $numCoreCharts + 1
+                    $bktGpu  = & $getTimeBuckets $gHist $now 'Util'    $chartWidth $bucketSeconds
+                    $bktVram = & $getTimeBuckets $gHist $now 'VramPct' $chartWidth $bucketSeconds
+
+                    [void]$out.AppendLine(" ${cBold}${gpuChartNo}. $($ui.ChartGpu)${cReset}  ${cGray}${stsGpu}${cReset}${clr}")
+                    foreach ($ln in (& $newMultiRowChart $bktGpu 0 100 $rGpu '0' '%' { param($v) & $getMetricColor $v 60 85 $false } $clr)) {
+                        [void]$out.AppendLine($ln)
+                    }
+
+                    [void]$out.AppendLine(" ${cBold}$($gpuChartNo + 1). $($ui.ChartVram)${cReset}  ${cGray}${stsVram}${cReset}${clr}")
+                    foreach ($ln in (& $newMultiRowChart $bktVram 0 100 $rVram '0' '%' { param($v) & $getMetricColor $v 70 88 $false } $clr)) {
                         [void]$out.AppendLine($ln)
                     }
                 }
@@ -827,9 +1183,10 @@ function Start-WinTop {
             }
 
             # Bottom status / hotkey bar
-            $hkVis = Get-DisplayWidth -Text " $($ui.Hotkeys)"
+            $hkText = $ui.Hotkeys + $(if ($showGpu -and $gpuAdapters.Count -gt 1) { $ui.HotkeyGpu } else { '' })
+            $hkVis = Get-DisplayWidth -Text " $hkText"
             $hkPad = [string]::new(' ', [math]::Max(0, $termWidth - $hkVis))
-            [void]$out.Append("${cBgBar}${cWhite} $($ui.Hotkeys)${hkPad}${cReset}${clr}")
+            [void]$out.Append("${cBgBar}${cWhite} ${hkText}${hkPad}${cReset}${clr}")
             if ($canControlCursor) { [void]$out.Append("$esc[J") } else { [void]$out.AppendLine() }
 
             Write-Host $out.ToString() -NoNewline
@@ -854,6 +1211,9 @@ function Start-WinTop {
                         $View = 'Processes'; $forceRedraw = $true; Clear-Host; break
                     } elseif ($kChar -eq 's') {
                         $SortBy = if ($SortBy -eq 'CPU') { 'MEM' } else { 'CPU' }
+                        $forceRedraw = $true; break
+                    } elseif ($kChar -eq 'g' -and $hasGpu -and $gpuAdapters.Count -gt 1) {
+                        $gpuSel = ($gpuSel + 1) % $gpuAdapters.Count
                         $forceRedraw = $true; break
                     } elseif ($kChar -eq 'l') {
                         $activeLang = if ($activeLang -eq 'zh-TW') { 'en' } else { 'zh-TW' }

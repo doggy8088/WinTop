@@ -6,7 +6,7 @@
     Author               = 'Will 保哥'
     CompanyName          = 'Will 保哥'
     Copyright            = '(c) 2026 Will 保哥. All rights reserved.'
-    Description          = 'Interactive full-screen TUI system & CPU monitor ("top" for Windows) featuring 5-minute multi-row trend charts, CPU clock/Turbo telemetry, memory usage, ACPI thermal monitoring, and live top processes.'
+    Description          = 'Interactive full-screen TUI system & CPU monitor ("top" for Windows) featuring 5-minute multi-row trend charts, CPU clock/Turbo telemetry, memory usage, ACPI thermal monitoring, GPU usage and VRAM monitoring (NVIDIA / AMD / Intel), and live top processes.'
     PowerShellVersion    = '5.1'
 
     FunctionsToExport    = @('Start-WinTop')
@@ -17,7 +17,7 @@
     PrivateData          = @{
         PSData = @{
             Tags         = @(
-                'top', 'htop', 'btop', 'wintop', 'monitor', 'cpu', 'memory',
+                'top', 'htop', 'btop', 'wintop', 'monitor', 'cpu', 'memory', 'gpu', 'vram',
                 'thermal', 'temperature', 'tui', 'dashboard', 'performance',
                 'process', 'PSEdition_Desktop', 'PSEdition_Core', 'Windows'
             )
