@@ -169,32 +169,36 @@ Describe 'GPU monitoring (issue #2)' {
     }
 
     Context 'Get-WinTopGpuSnapshot' {
-        It 'computes VRAM% from dedicated memory on discrete GPUs and from dedicated+shared on integrated GPUs' {
+        It 'reports dedicated memory as VRAM and shared memory separately, without guessing the memory architecture' {
             InModuleScope WinTop {
-                $d = 'luid_0x00000000_0x0001097f'   # discrete, 8 GiB
-                $i = 'luid_0x00000000_0x0000aaaa'   # integrated, 1 GiB total (dedicated + shared)
+                $d = 'luid_0x00000000_0x0001097f'   # discrete: 8 GiB dedicated
+                $i = 'luid_0x00000000_0x0000aaaa'   # integrated with a 2 GiB firmware carve-out (looks "big" but shares system RAM)
                 $adapters = @(
-                    [PSCustomObject]@{ Index = 0; Name = 'dGPU'; Key = $d; Uma = $false; TotalBytes = [double]8GB },
-                    [PSCustomObject]@{ Index = 1; Name = 'iGPU'; Key = $i; Uma = $true;  TotalBytes = [double]1GB })
+                    [PSCustomObject]@{ Index = 0; Name = 'dGPU'; Key = $d; TotalBytes = [double]8GB; SharedTotalBytes = [double]32GB },
+                    [PSCustomObject]@{ Index = 1; Name = 'iGPU'; Key = $i; TotalBytes = [double]2GB; SharedTotalBytes = [double]16GB })
                 $eng = New-TestCategory @{ 'Utilization Percentage' = @() }
                 $mem = New-TestCategory @{
                     'Dedicated Usage' = @(
                         @{ Name = "${d}_phys_0"; Sample = (New-TestSample -Raw ([long]2GB) -Ts 1) },
-                        @{ Name = "${i}_phys_0"; Sample = (New-TestSample -Raw ([long]128MB) -Ts 1) })
+                        @{ Name = "${i}_phys_0"; Sample = (New-TestSample -Raw ([long]512MB) -Ts 1) })
                     'Shared Usage' = @(
-                        @{ Name = "${d}_phys_0"; Sample = (New-TestSample -Raw ([long]1GB) -Ts 1) },     # ignored for discrete GPUs
-                        @{ Name = "${i}_phys_0"; Sample = (New-TestSample -Raw ([long]384MB) -Ts 1) })
+                        @{ Name = "${d}_phys_0"; Sample = (New-TestSample -Raw ([long]1GB) -Ts 1) },
+                        @{ Name = "${i}_phys_0"; Sample = (New-TestSample -Raw ([long]3GB) -Ts 1) })
                 }
                 $s = Get-WinTopGpuSnapshot -Adapters $adapters -EngineCategory $eng -MemoryCategory $mem -State @{ Prev = @{}; Meta = @{} }
-                $s[$d].VramPct | Should -Be 25    # 2 GiB / 8 GiB
-                $s[$d].Util    | Should -Be 0
-                $s[$i].VramPct | Should -Be 50    # (128 MiB + 384 MiB) / 1 GiB
+                $s[$d].VramPct          | Should -Be 25            # 2 GiB / 8 GiB dedicated
+                $s[$d].UsedBytes        | Should -Be ([double]2GB)
+                $s[$d].SharedUsedBytes  | Should -Be ([double]1GB)
+                $s[$d].SharedTotalBytes | Should -Be ([double]32GB)
+                $s[$d].Util             | Should -Be 0
+                $s[$i].VramPct          | Should -Be 25            # 512 MiB / 2 GiB dedicated; the 3 GiB of shared use is NOT folded in
+                $s[$i].SharedUsedBytes  | Should -Be ([double]3GB)
             }
         }
         It 'reports 0% (not a divide-by-zero) when the adapter capacity is unknown' {
             InModuleScope WinTop {
                 $k = 'luid_0x00000000_0x0001097f'
-                $adapters = @([PSCustomObject]@{ Index = 0; Name = 'GPU 0'; Key = $k; Uma = $false; TotalBytes = 0.0 })
+                $adapters = @([PSCustomObject]@{ Index = 0; Name = 'GPU 0'; Key = $k; TotalBytes = 0.0; SharedTotalBytes = 0.0 })
                 $eng = New-TestCategory @{ 'Utilization Percentage' = @() }
                 $mem = New-TestCategory @{ 'Dedicated Usage' = @(@{ Name = "${k}_phys_0"; Sample = (New-TestSample -Raw 12345 -Ts 1) }) }
                 $s = Get-WinTopGpuSnapshot -Adapters $adapters -EngineCategory $eng -MemoryCategory $mem -State @{ Prev = @{}; Meta = @{} }
@@ -223,6 +227,17 @@ Describe 'Start-WinTop with GPU support' {
         }
         $zh = Start-WinTop -Count 2 -Interval 0.5 -Language zh-TW -View Charts -NoMaximize 6>&1 | Out-String
         $zh | Should -Match 'WinTop'
+    }
+    It 'never renders a frame taller than the terminal (36-row fallback) in any view' {
+        foreach ($view in 'Split', 'Charts', 'Processes') {
+            # Join the raw Write-Host messages: Out-String would re-wrap them at the host width on Windows PowerShell 5.1
+            $text  = (@(Start-WinTop -Count 2 -Interval 0.5 -Language en -View $view -NoMaximize 6>&1 | ForEach-Object { [string]$_ }) -join '') -replace '\x1b\[[0-9;?]*[a-zA-Z]', ''
+            $lines = $text -split "`r?`n"
+            $topLeft = [string][char]0x2554   # box-drawing corner of the header frame (kept out of the file: 5.1 reads BOM-less files as ANSI)
+            $start = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match ('^' + $topLeft) })[-1]   # last frame's top border
+            $end   = @($start..($lines.Count - 1) | Where-Object { $lines[$_] -match 'Keys:|\[Q/Esc\]' })[0]   # its hotkey bar
+            ($end - $start + 1) | Should -BeLessOrEqual 36
+        }
     }
     It 'shows GPU rows only when a GPU is available' -Skip:(-not $machineHasGpu) {
         $out = (Start-WinTop -Count 2 -Interval 0.5 -Language en -View Charts -NoMaximize 6>&1 | Out-String) -replace '\x1b\[[0-9;?]*[a-zA-Z]', ''

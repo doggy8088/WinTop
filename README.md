@@ -79,8 +79,8 @@ top -View Processes -SortBy MEM
 
 - Needs the WDDM 2.0+ `GPU Engine` / `GPU Adapter Memory` performance counters (Windows 10 version 1709 or later with a WDDM 2.x driver). Without them the GPU rows are simply not shown.
 - **GPU %** is the utilization of the adapter's busiest engine (3D, Copy, Video Decode, ...), which is what Task Manager reports as the GPU's percentage.
-- **VRAM** is *dedicated* video memory (`used / total`). Integrated GPUs have almost no dedicated memory and use system RAM, so for them WinTop shows dedicated + shared memory instead (labelled `shared` in the GPU header line).
-- In the split view the two GPU charts only appear when the terminal is tall enough for every chart; the GPU gauges are always shown, and the Charts view (**`2`**) always includes the GPU charts.
+- **VRAM** is *dedicated* video memory (`used / total`). Like Task Manager, the *shared* memory (system RAM the GPU may borrow, `used / total`) is reported separately in the `GPU:` header line instead of guessing whether a GPU is integrated. Integrated GPUs keep most of their data in shared memory, so look there.
+- The GPU rows (header line + two gauges) and the two GPU charts only appear when the terminal is tall enough to hold them on top of the normal layout, so they never push the dashboard past the bottom of the window. As a rough guide, on a machine with a thermal sensor the GPU gauges need about 28 rows in the Charts view, 36 in the Split view and 23 in the Processes view, and the GPU charts additionally need about 34 rows in the Charts view and 46 in the Split view (without a thermal sensor, 1-6 rows fewer). Maximize the window (the default) to see everything.
 - Per-process GPU/VRAM statistics are not included (yet).
 
 ## License

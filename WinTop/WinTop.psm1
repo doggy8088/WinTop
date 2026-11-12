@@ -282,8 +282,8 @@ function Get-WinTopStrings {
             ChartGpu     = 'GPU 使用率 (%)'
             ChartVram    = '顯示記憶體使用率 (%)'
             VramKind     = '專用'
-            VramKindUma  = '共用'
-            HotkeyGpu    = '  [G]切換GPU'
+            GpuShared    = '共用'
+            GpuSwitchHint = 'G=切換'
         }
     } else {
         return @{
@@ -320,8 +320,8 @@ function Get-WinTopStrings {
             ChartGpu     = 'GPU Usage (%)'
             ChartVram    = 'VRAM Usage (%)'
             VramKind     = 'VRAM'
-            VramKindUma  = 'shared'
-            HotkeyGpu    = '  [G]GPU'
+            GpuShared    = 'shared'
+            GpuSwitchHint = 'G=next'
         }
     }
 }
@@ -430,9 +430,10 @@ function Get-WinTopGpuMemory {
     return @{ Dedicated = $dedicated; Shared = $shared }
 }
 
-# Hardware GPUs sorted discrete-first (largest dedicated memory first). Integrated GPUs (little dedicated memory) use
-# system RAM, so for those the "VRAM" figure is dedicated + shared. Names/capacity come from DXGI; if DXGI is
-# unavailable the adapters seen in the counters are listed as "GPU n" with unknown (0) capacity.
+# Hardware GPUs, largest dedicated memory first (so a discrete GPU is listed before an integrated one). Like Task
+# Manager, dedicated and shared memory are reported separately: DXGI cannot tell whether an adapter is UMA (and asking
+# D3D12 would wake a sleeping discrete GPU), so no memory architecture is inferred. Names/capacity come from DXGI; if
+# DXGI is unavailable the adapters seen in the counters are listed as "GPU n" with unknown (0) capacity.
 function Get-WinTopGpuAdapterList {
     param([Parameter(Mandatory)]$MemoryCategory)
     $counterKeys = @{}
@@ -445,25 +446,25 @@ function Get-WinTopGpuAdapterList {
         if ($counterKeys.Count -gt 0 -and -not $counterKeys.ContainsKey($a.Key)) { continue }
         $name = ([string]$a.Name -replace '[\x00-\x1F\x7F]', '' -replace '\s+', ' ').Trim()
         if (-not $name) { $name = "GPU $idx" }
-        $uma = $a.DedicatedBytes -lt 1GB
         $list.Add([PSCustomObject]@{
-            Index      = $idx++
-            Name       = $name
-            Key        = $a.Key
-            Uma        = $uma
-            TotalBytes = [double]$(if ($uma) { $a.DedicatedBytes + $a.SharedBytes } else { $a.DedicatedBytes })
+            Index            = $idx++
+            Name             = $name
+            Key              = $a.Key
+            TotalBytes       = [double]$a.DedicatedBytes   # dedicated video memory (VRAM)
+            SharedTotalBytes = [double]$a.SharedBytes      # system memory the GPU may borrow
         })
     }
     if ($list.Count -eq 0) {
         foreach ($key in ($counterKeys.Keys | Sort-Object)) {
-            $list.Add([PSCustomObject]@{ Index = $idx; Name = "GPU $idx"; Key = $key; Uma = $false; TotalBytes = 0.0 })
+            $list.Add([PSCustomObject]@{ Index = $idx; Name = "GPU $idx"; Key = $key; TotalBytes = 0.0; SharedTotalBytes = 0.0 })
             $idx++
         }
     }
-    return @($list | Sort-Object @{ Expression = { $_.Uma } }, @{ Expression = { $_.TotalBytes }; Descending = $true }, Index)
+    return @($list | Sort-Object @{ Expression = { $_.TotalBytes }; Descending = $true }, Index)
 }
 
-# One sample for every adapter: adapter key -> @{ Util (%), UsedBytes, TotalBytes, VramPct (%) }
+# One sample for every adapter: adapter key -> @{ Util (%), UsedBytes / TotalBytes / VramPct (dedicated memory),
+# SharedUsedBytes / SharedTotalBytes }
 function Get-WinTopGpuSnapshot {
     param(
         [Parameter(Mandatory)]$Adapters,
@@ -478,9 +479,15 @@ function Get-WinTopGpuSnapshot {
         $u  = if ($util.ContainsKey($a.Key)) { [double]$util[$a.Key] } else { 0.0 }
         $ded = [double]$mem.Dedicated[$a.Key]
         $shr = [double]$mem.Shared[$a.Key]
-        $used = if ($a.Uma) { $ded + $shr } else { $ded }
-        $pct  = if ($a.TotalBytes -gt 0) { [math]::Max(0.0, [math]::Min(100.0, $used / $a.TotalBytes * 100.0)) } else { 0.0 }
-        $snapshot[$a.Key] = [PSCustomObject]@{ Util = $u; UsedBytes = $used; TotalBytes = $a.TotalBytes; VramPct = $pct }
+        $pct = if ($a.TotalBytes -gt 0) { [math]::Max(0.0, [math]::Min(100.0, $ded / $a.TotalBytes * 100.0)) } else { 0.0 }
+        $snapshot[$a.Key] = [PSCustomObject]@{
+            Util             = $u
+            UsedBytes        = $ded
+            TotalBytes       = $a.TotalBytes
+            VramPct          = $pct
+            SharedUsedBytes  = $shr
+            SharedTotalBytes = $a.SharedTotalBytes
+        }
     }
     return $snapshot
 }
@@ -991,7 +998,18 @@ function Start-WinTop {
 
             # Selected GPU (G cycles through adapters when there is more than one)
             $showGpu = $false
-            if ($hasGpu -and $gpuNow.ContainsKey($gpuAdapters[$gpuSel].Key) -and $gpuDeltas.ContainsKey($gpuAdapters[$gpuSel].Key)) {
+            # The GPU header + gauge rows add 3 lines. Show them only if the terminal can hold them on top of the view's minimum
+            # layout (charts need >= 2 plot rows each, the process list >= 3 rows), so they never make a frame taller than the terminal.
+            # Split-view minimums come from the budget arithmetic below: the process share (max(6, 38% of the body)) grows
+            # before the charts leave their 2-plot-row floor, so a frame fits only from 23 body lines with the thermal chart (18 without).
+            $nCoreCharts = if ($hasThermal) { 4 } else { 3 }
+            $minBodyLines = switch ($View) {
+                'Charts'    { 3 + 3 * $nCoreCharts }
+                'Processes' { 10 }
+                default     { if ($hasThermal) { 23 } else { 18 } }
+            }
+            $gpuRowsFit = $termHeight -ge (4 + $nCoreCharts + 1 + 1 + 3 + $minBodyLines)   # 4 header + gauges + separator + hotkey bar + 3 GPU rows
+            if ($hasGpu -and $gpuRowsFit -and $gpuNow.ContainsKey($gpuAdapters[$gpuSel].Key) -and $gpuDeltas.ContainsKey($gpuAdapters[$gpuSel].Key)) {
                 $showGpu  = $true
                 $gAd      = $gpuAdapters[$gpuSel]
                 $gNow     = $gpuNow[$gAd.Key]
@@ -1008,7 +1026,7 @@ function Start-WinTop {
                 $padGV    = [string]::new(' ', [math]::Max(1, 10 - $dltVram.Width))
                 $vramTag  = if ($gNow.TotalBytes -gt 0) { "{0,4:N1}/{1:N0}G" -f ($gNow.UsedBytes / 1GB), ($gNow.TotalBytes / 1GB) } else { 'N/A' }
                 $vramCap  = if ($gNow.TotalBytes -ge 1GB) { "{0:N0}G" -f ($gNow.TotalBytes / 1GB) } elseif ($gNow.TotalBytes -gt 0) { "{0:N0}M" -f ($gNow.TotalBytes / 1MB) } else { 'N/A' }
-                $vramKind = if ($gAd.Uma) { $ui.VramKindUma } else { $ui.VramKind }
+                $sharedTag = if ($gNow.SharedTotalBytes -gt 0) { "{0:N1}/{1:N0}G" -f ($gNow.SharedUsedBytes / 1GB), ($gNow.SharedTotalBytes / 1GB) } else { 'N/A' }
             }
 
             $prevUsage = $usage; $prevMHz = $mhz; $prevMemPct = $memPct; $prevTemp = $tempC
@@ -1031,8 +1049,9 @@ function Start-WinTop {
             $hdr2 = " ${cGray}$($ui.CPU):${cReset} ${cWhite}${cpuName} ($($ui.BaseClock) ${baseMHz} MHz, ${numCores}$($ui.Cores)/${numThreads}$($ui.Threads))${cReset}"
             $hdrLines = @($hdr1, $hdr2)
             if ($showGpu) {
-                $gpuMulti = if ($gpuAdapters.Count -gt 1) { "  ${cGray}[$($gpuSel + 1)/$($gpuAdapters.Count)]${cReset}" } else { '' }
-                $hdrLines += " ${cGray}GPU:${cReset} ${cWhite}$($gAd.Name) (${vramCap} ${vramKind})${cReset}${gpuMulti}"
+                # With several GPUs the switch hint lives here (not in the hotkey bar, which is already ~100 columns wide)
+                $gpuMulti = if ($gpuAdapters.Count -gt 1) { "  ${cGray}[$($gpuSel + 1)/$($gpuAdapters.Count) $($ui.GpuSwitchHint)]${cReset}" } else { '' }
+                $hdrLines += " ${cGray}GPU:${cReset} ${cWhite}$($gAd.Name) (${vramCap} $($ui.VramKind))${cReset}  ${cGray}$($ui.GpuShared):${cReset} ${cWhite}${sharedTag}${cReset}${gpuMulti}"
             }
             foreach ($hLine in $hdrLines) {
                 $visW = Get-DisplayWidth -Text $hLine
@@ -1092,8 +1111,9 @@ function Start-WinTop {
                 [void]$out.AppendLine(" ${cBold}${cCyan}[${chartTitle}]${cReset}${clr}")
 
                 $numCoreCharts = if ($hasThermal) { 4 } else { 3 }
-                # The two GPU charts always show in the Charts view; in the split view only when every chart still gets >= 2 plot rows
-                $showGpuCharts = $showGpu -and ($View -eq 'Charts' -or $chartBudget -ge (3 + 3 * ($numCoreCharts + 2)))
+                # The two GPU charts only show when every chart (CPU ones included) still gets >= 2 plot rows, in every view,
+                # so adding them can never push a frame that used to fit past the terminal height
+                $showGpuCharts = $showGpu -and ($chartBudget -ge (3 + 3 * ($numCoreCharts + 2)))
                 $numCharts = $numCoreCharts + $(if ($showGpuCharts) { 2 } else { 0 })
                 # Overhead inside chart block: 1 section header + $numCharts titles + 2 time axis lines
                 $availPlotRows = [math]::Max($numCharts * 2, $chartBudget - (3 + $numCharts))
@@ -1183,10 +1203,9 @@ function Start-WinTop {
             }
 
             # Bottom status / hotkey bar
-            $hkText = $ui.Hotkeys + $(if ($showGpu -and $gpuAdapters.Count -gt 1) { $ui.HotkeyGpu } else { '' })
-            $hkVis = Get-DisplayWidth -Text " $hkText"
+            $hkVis = Get-DisplayWidth -Text " $($ui.Hotkeys)"
             $hkPad = [string]::new(' ', [math]::Max(0, $termWidth - $hkVis))
-            [void]$out.Append("${cBgBar}${cWhite} ${hkText}${hkPad}${cReset}${clr}")
+            [void]$out.Append("${cBgBar}${cWhite} $($ui.Hotkeys)${hkPad}${cReset}${clr}")
             if ($canControlCursor) { [void]$out.Append("$esc[J") } else { [void]$out.AppendLine() }
 
             Write-Host $out.ToString() -NoNewline
