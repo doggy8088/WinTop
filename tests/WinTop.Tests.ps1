@@ -127,6 +127,26 @@ Describe 'CPU usage fallback (issue #1: Hyper-V guests report 0% / 0 MHz)' {
         It 'GetProcessorCurrentMhz never throws and is non-negative' {
             [WinTop.NativeHelper]::GetProcessorCurrentMhz() | Should -BeGreaterOrEqual 0
         }
+        It 'GetProcessorCurrentMhz is not affected by a restricted process affinity mask' -Skip:([Environment]::ProcessorCount -lt 2) {
+            # Environment.ProcessorCount follows the affinity mask on modern .NET (read once at process start), so the
+            # affinity must be applied when the child process is created: `start /affinity 1` pins it to CPU 0 from the start.
+            $psd1   = (Resolve-Path (Join-Path $PSScriptRoot '..\WinTop\WinTop.psd1')).Path
+            $hostExe = (Get-Process -Id $PID).Path
+            $script = Join-Path $TestDrive 'probe.ps1'
+            Set-Content -Path $script -Value "Import-Module '$psd1'; Write-Output ([WinTop.NativeHelper]::GetProcessorCurrentMhz())"
+
+            $run = {
+                param([string]$AffinityArg, [string]$OutFile)
+                # The empty "" is start's window-title argument; without it a quoted exe path would be mistaken for the title
+                cmd /c "start `"`" /wait /b $AffinityArg `"$hostExe`" -NoProfile -ExecutionPolicy Bypass -File `"$script`" > `"$OutFile`" 2>&1"
+                [int](Get-Content -Path $OutFile -Raw).Trim()
+            }
+            $unrestricted = & $run '' (Join-Path $TestDrive 'out-free.txt')
+            $restricted   = & $run '/affinity 1' (Join-Path $TestDrive 'out-pinned.txt')
+
+            # Whatever the platform reports (possibly 0 inside a VM), pinning the process must not turn a success into a failure
+            ($restricted -gt 0) | Should -Be ($unrestricted -gt 0)
+        }
     }
 }
 

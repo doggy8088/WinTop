@@ -105,9 +105,13 @@ namespace WinTop {
         private static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
         [DllImport("powrprof.dll")]
         private static extern uint CallNtPowerInformation(int informationLevel, IntPtr inputBuffer, uint inputBufferLength, IntPtr outputBuffer, uint outputBufferLength);
+        [DllImport("kernel32.dll")]
+        private static extern uint GetActiveProcessorCount(ushort groupNumber);
 
-        // Whole-system CPU times. Works on every Windows guest/host, unlike the "% Processor Utility"
-        // performance counter which needs APERF/MPERF MSRs that Hyper-V guests commonly do not expose.
+        // System-wide CPU times (idle / kernel / user). Works on every Windows guest/host, unlike the
+        // "% Processor Utility" performance counter which needs APERF/MPERF MSRs that Hyper-V guests commonly do not expose.
+        // NOTE: GetSystemTimes only covers the calling thread's primary processor group (up to 64 logical processors),
+        // so WinTop prefers the group-aware "% Processor Time" counter and uses this only when that is unavailable.
         public static CpuTimes GetCpuTimes() {
             var t = new CpuTimes();
             long idle, kernel, user;
@@ -124,11 +128,18 @@ namespace WinTop {
         public static int GetProcessorCurrentMhz() {
             const int ProcessorInformation = 11;
             const int EntrySize = 24; // PROCESSOR_POWER_INFORMATION: 6 x ULONG
-            int count = Environment.ProcessorCount;
+            const ushort AllProcessorGroups = 0xFFFF;
+            // Size for every processor in the system: Environment.ProcessorCount honours the process affinity mask
+            // on modern .NET, which can be smaller than what the power-information API needs.
+            int count = (int)GetActiveProcessorCount(AllProcessorGroups);
+            if (count < 1) count = Environment.ProcessorCount;
             if (count < 1) return 0;
-            IntPtr buf = Marshal.AllocHGlobal(count * EntrySize);
+            int size = count * EntrySize;
+            IntPtr buf = Marshal.AllocHGlobal(size);
             try {
-                if (CallNtPowerInformation(ProcessorInformation, IntPtr.Zero, 0, buf, (uint)(count * EntrySize)) != 0) return 0;
+                // Zero the buffer: only the entries the API fills are averaged below (unfilled ones read CurrentMhz == 0)
+                for (int off = 0; off < size; off += 4) Marshal.WriteInt32(buf, off, 0);
+                if (CallNtPowerInformation(ProcessorInformation, IntPtr.Zero, 0, buf, (uint)size) != 0) return 0;
                 long sum = 0;
                 int n = 0;
                 for (int i = 0; i < count; i++) {
@@ -298,7 +309,8 @@ function Get-WinTopCpuLoad {
 
 # Picks the CPU usage source. "% Processor Utility" is preferred (matches Task Manager), but Hyper-V guests and
 # some other VMs expose the counter yet leave it at 0 forever. When the counter is missing, or keeps reading 0
-# while the OS clearly reports activity for 3 consecutive samples, switch to the GetSystemTimes-based load.
+# while the OS clearly reports activity for 3 consecutive samples, switch to the OS busy-time load (the group-aware
+# "% Processor Time" counter, or GetSystemTimes when that counter is unavailable).
 # $State is a caller-owned hashtable: @{ Streak = 0; UseSystem = $false }.
 function Resolve-WinTopCpuUsage {
     param(
@@ -430,7 +442,16 @@ function Start-WinTop {
         if ($cntPerf) { $null = $cntPerf.NextValue() }
     } catch {}
 
-    # Fallback CPU usage source (GetSystemTimes) for guests where the Processor Utility counter is missing or stuck at 0
+    # Fallback CPU usage sources for guests where "% Processor Utility" is missing or stuck at 0:
+    #  1. "Processor Information\% Processor Time" - idle-time based (no APERF/MPERF MSRs needed) and aggregates ALL processor groups
+    #  2. GetSystemTimes - always available, but only sees the primary processor group (<= 64 logical processors)
+    $cntBusy = $null
+    try {
+        if ([System.Diagnostics.PerformanceCounterCategory]::Exists('Processor Information')) {
+            $cntBusy = New-Object System.Diagnostics.PerformanceCounter('Processor Information', '% Processor Time', '_Total', $true)
+            $null = $cntBusy.NextValue()
+        }
+    } catch { $cntBusy = $null }
     $prevCpuTimes  = [WinTop.NativeHelper]::GetCpuTimes()
     $cpuUsageState = @{ Streak = 0; UseSystem = (-not $cntUtil) }
 
@@ -674,9 +695,13 @@ function Start-WinTop {
             $ui = Get-WinTopStrings -Lang $activeLang
 
             # 1. Sample CPU, Memory, Thermal counters (<10ms)
-            $curCpuTimes = [WinTop.NativeHelper]::GetCpuTimes()
-            $sysLoad     = Get-WinTopCpuLoad -Prev $prevCpuTimes -Cur $curCpuTimes
-            $prevCpuTimes = $curCpuTimes
+            if ($cntBusy) {
+                $sysLoad = [double]$cntBusy.NextValue()
+            } else {
+                $curCpuTimes  = [WinTop.NativeHelper]::GetCpuTimes()
+                $sysLoad      = Get-WinTopCpuLoad -Prev $prevCpuTimes -Cur $curCpuTimes
+                $prevCpuTimes = $curCpuTimes
+            }
             $ctrUsage = if ($cntUtil) { [double]$cntUtil.NextValue() } else { $null }
             $usage    = Resolve-WinTopCpuUsage -CounterValue $ctrUsage -SystemValue $sysLoad -State $cpuUsageState
 
@@ -987,6 +1012,7 @@ function Start-WinTop {
     } finally {
         if ($cntUtil)  { $cntUtil.Dispose() }
         if ($cntPerf)  { $cntPerf.Dispose() }
+        if ($cntBusy)  { $cntBusy.Dispose() }
         if ($cntTemp)  { $cntTemp.Dispose() }
         if ($cntLimit) { $cntLimit.Dispose() }
         if ($canControlCursor) {
