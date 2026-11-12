@@ -463,6 +463,15 @@ function Get-WinTopGpuAdapterList {
     return @($list | Sort-Object @{ Expression = { $_.TotalBytes }; Descending = $true }, Index)
 }
 
+# "used/total" memory text: "2.1/8G" for GiB-sized capacities and "64/128M" for sub-GiB ones (whole GiB would turn a
+# 128 MiB adapter into "0.1/0G"). An unknown capacity (0) gives "N/A".
+function Format-WinTopMemory {
+    param([double]$UsedBytes, [double]$TotalBytes)
+    if ($TotalBytes -le 0) { return 'N/A' }
+    if ($TotalBytes -ge 1GB) { return ('{0:N1}/{1:N0}G' -f ($UsedBytes / 1GB), ($TotalBytes / 1GB)) }
+    return ('{0:N0}/{1:N0}M' -f ($UsedBytes / 1MB), ($TotalBytes / 1MB))
+}
+
 # One sample for every adapter: adapter key -> @{ Util (%), UsedBytes / TotalBytes / VramPct (dedicated memory),
 # SharedUsedBytes / SharedTotalBytes }
 function Get-WinTopGpuSnapshot {
@@ -1024,9 +1033,9 @@ function Start-WinTop {
                 $barVram  = & $newGaugeBar $gNow.VramPct 0 100 $gaugeWidth $colVram
                 $padGU    = [string]::new(' ', [math]::Max(1, 10 - $dltGpu.Width))
                 $padGV    = [string]::new(' ', [math]::Max(1, 10 - $dltVram.Width))
-                $vramTag  = if ($gNow.TotalBytes -gt 0) { "{0,4:N1}/{1:N0}G" -f ($gNow.UsedBytes / 1GB), ($gNow.TotalBytes / 1GB) } else { 'N/A' }
+                $vramTag  = Format-WinTopMemory -UsedBytes $gNow.UsedBytes -TotalBytes $gNow.TotalBytes
                 $vramCap  = if ($gNow.TotalBytes -ge 1GB) { "{0:N0}G" -f ($gNow.TotalBytes / 1GB) } elseif ($gNow.TotalBytes -gt 0) { "{0:N0}M" -f ($gNow.TotalBytes / 1MB) } else { 'N/A' }
-                $sharedTag = if ($gNow.SharedTotalBytes -gt 0) { "{0:N1}/{1:N0}G" -f ($gNow.SharedUsedBytes / 1GB), ($gNow.SharedTotalBytes / 1GB) } else { 'N/A' }
+                $sharedTag = Format-WinTopMemory -UsedBytes $gNow.SharedUsedBytes -TotalBytes $gNow.SharedTotalBytes
             }
 
             $prevUsage = $usage; $prevMHz = $mhz; $prevMemPct = $memPct; $prevTemp = $tempC

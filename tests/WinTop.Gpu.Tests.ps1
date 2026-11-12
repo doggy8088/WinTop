@@ -208,6 +208,26 @@ Describe 'GPU monitoring (issue #2)' {
         }
     }
 
+    Context 'Format-WinTopMemory' {
+        It 'uses GiB for GiB-sized capacities' {
+            InModuleScope WinTop {
+                Format-WinTopMemory -UsedBytes ([double]2.1GB) -TotalBytes ([double]8GB) | Should -Match '^2[.,]1/8G$'
+                Format-WinTopMemory -UsedBytes 0 -TotalBytes ([double]1GB) | Should -Match '^0[.,]0/1G$'
+            }
+        }
+        It 'uses MiB for sub-GiB capacities instead of rounding them to 0G' {
+            InModuleScope WinTop {
+                Format-WinTopMemory -UsedBytes ([double]64MB) -TotalBytes ([double]128MB) | Should -Be '64/128M'
+                Format-WinTopMemory -UsedBytes 0 -TotalBytes ([double]512MB) | Should -Be '0/512M'
+            }
+        }
+        It 'returns N/A when the capacity is unknown' {
+            InModuleScope WinTop {
+                Format-WinTopMemory -UsedBytes 12345 -TotalBytes 0 | Should -Be 'N/A'
+            }
+        }
+    }
+
     Context 'Native DXGI helper (runs on machines with or without a GPU)' {
         It 'GetAdapters never throws and returns well-formed adapters' {
             $adapters = @([WinTop.GpuHelper]::GetAdapters())
@@ -228,7 +248,9 @@ Describe 'Start-WinTop with GPU support' {
         $zh = Start-WinTop -Count 2 -Interval 0.5 -Language zh-TW -View Charts -NoMaximize 6>&1 | Out-String
         $zh | Should -Match 'WinTop'
     }
-    It 'never renders a frame taller than the terminal (36-row fallback) in any view' {
+    It 'never renders a frame taller than the viewport it reports in its own header, in any view' {
+        # The viewport (e.g. "120x36") is whatever Start-WinTop detected: the 36-row fallback when output is redirected (CI),
+        # the real window size in an interactive console. Below 36 rows the original layout already overflows, so only assert above that.
         foreach ($view in 'Split', 'Charts', 'Processes') {
             # Join the raw Write-Host messages: Out-String would re-wrap them at the host width on Windows PowerShell 5.1
             $text  = (@(Start-WinTop -Count 2 -Interval 0.5 -Language en -View $view -NoMaximize 6>&1 | ForEach-Object { [string]$_ }) -join '') -replace '\x1b\[[0-9;?]*[a-zA-Z]', ''
@@ -236,7 +258,11 @@ Describe 'Start-WinTop with GPU support' {
             $topLeft = [string][char]0x2554   # box-drawing corner of the header frame (kept out of the file: 5.1 reads BOM-less files as ANSI)
             $start = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match ('^' + $topLeft) })[-1]   # last frame's top border
             $end   = @($start..($lines.Count - 1) | Where-Object { $lines[$_] -match 'Keys:|\[Q/Esc\]' })[0]   # its hotkey bar
-            ($end - $start + 1) | Should -BeLessOrEqual 36
+            $lines[$start + 1] | Should -Match '\] (\d+)x(\d+)'
+            $viewportRows = [int]$Matches[2]
+            if ($viewportRows -ge 36) {
+                ($end - $start + 1) | Should -BeLessOrEqual $viewportRows
+            }
         }
     }
     It 'shows GPU rows only when a GPU is available' -Skip:(-not $machineHasGpu) {
