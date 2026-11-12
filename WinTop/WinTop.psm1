@@ -343,6 +343,21 @@ function Get-DisplayWidth {
     return $w
 }
 
+# Truncates $Text to at most $MaxWidth display columns (wide CJK characters count as 2), ending in "~" when shortened.
+function Limit-WinTopText {
+    param([string]$Text, [int]$MaxWidth)
+    if ((Get-DisplayWidth -Text $Text) -le $MaxWidth) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $used = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $cw = Get-DisplayWidth -Text ([string]$ch)
+        if ($used + $cw -gt $MaxWidth - 1) { break }
+        [void]$sb.Append($ch)
+        $used += $cw
+    }
+    return $sb.ToString() + '~'
+}
+
 # GPU telemetry uses the vendor-neutral WDDM performance counters (NVIDIA / AMD / Intel, Windows 10 1709+), the same
 # source Task Manager reads: "GPU Engine" (per process+engine utilization) and "GPU Adapter Memory" (VRAM usage).
 
@@ -1060,7 +1075,10 @@ function Start-WinTop {
             if ($showGpu) {
                 # With several GPUs the switch hint lives here (not in the hotkey bar, which is already ~100 columns wide)
                 $gpuMulti = if ($gpuAdapters.Count -gt 1) { "  ${cGray}[$($gpuSel + 1)/$($gpuAdapters.Count) $($ui.GpuSwitchHint)]${cReset}" } else { '' }
-                $hdrLines += " ${cGray}GPU:${cReset} ${cWhite}$($gAd.Name) (${vramCap} $($ui.VramKind))${cReset}  ${cGray}$($ui.GpuShared):${cReset} ${cWhite}${sharedTag}${cReset}${gpuMulti}"
+                $gpuLine = { param([string]$n) " ${cGray}GPU:${cReset} ${cWhite}${n} (${vramCap} $($ui.VramKind))${cReset}  ${cGray}$($ui.GpuShared):${cReset} ${cWhite}${sharedTag}${cReset}${gpuMulti}" }
+                # A long adapter name must not push the line past the box border: give it whatever width the rest leaves over
+                $gpuNameRoom = $innerWidth - (Get-DisplayWidth -Text (& $gpuLine ''))
+                $hdrLines += & $gpuLine (Limit-WinTopText -Text $gAd.Name -MaxWidth $gpuNameRoom)
             }
             foreach ($hLine in $hdrLines) {
                 $visW = Get-DisplayWidth -Text $hLine

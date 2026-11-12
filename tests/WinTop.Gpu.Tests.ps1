@@ -9,6 +9,26 @@ BeforeDiscovery {
 BeforeAll {
     Import-Module (Join-Path $PSScriptRoot '..\WinTop\WinTop.psd1') -Force -ErrorAction Stop
 
+    # Renders two ticks and returns the last frame: its text (ANSI stripped), its height, and the viewport size the frame
+    # prints in its own header, e.g. "[Charts] 120x36" (the 36-row fallback when output is redirected, the real window otherwise).
+    function script:Get-WinTopFrame {
+        param([string]$View = 'Split', [string]$Language = 'en')
+        # Join the raw Write-Host messages: Out-String would re-wrap them at the host width on Windows PowerShell 5.1
+        $raw   = @(Start-WinTop -Count 2 -Interval 0.5 -Language $Language -View $View -NoMaximize 6>&1 | ForEach-Object { [string]$_ }) -join ''
+        $lines = ($raw -replace '\x1b\[[0-9;?]*[a-zA-Z]', '') -split "`r?`n"
+        $topLeft = [string][char]0x2554   # box-drawing corner of the header frame (kept out of the file: 5.1 reads BOM-less files as ANSI)
+        $start = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match ('^' + $topLeft) })[-1]
+        $end   = @($start..($lines.Count - 1) | Where-Object { $lines[$_] -match 'Keys:|\[Q/Esc\]' })[0]
+        # Should -Match does not populate $Matches in this scope, so extract the viewport explicitly
+        $vp = [regex]::Match($lines[$start + 1], '\] (\d+)x(\d+)')
+        [PSCustomObject]@{
+            Text            = ($lines[$start..$end] -join "`n")
+            LineCount       = $end - $start + 1
+            ViewportMatched = $vp.Success
+            ViewportRows    = $(if ($vp.Success) { [int]$vp.Groups[2].Value } else { 0 })
+        }
+    }
+
     # Test doubles live in the module's script scope so InModuleScope blocks can use them.
     InModuleScope WinTop {
         # Minimal stand-in for PerformanceCounterCategory: ReadCategory()['<counter>'].Values -> InstanceName / Sample
@@ -208,6 +228,35 @@ Describe 'GPU monitoring (issue #2)' {
         }
     }
 
+    Context 'Limit-WinTopText' {
+        It 'returns text that already fits unchanged' {
+            InModuleScope WinTop {
+                Limit-WinTopText -Text 'NVIDIA GeForce RTX 2070' -MaxWidth 40 | Should -Be 'NVIDIA GeForce RTX 2070'
+                Limit-WinTopText -Text 'abc' -MaxWidth 3 | Should -Be 'abc'
+            }
+        }
+        It 'truncates by display width and ends with ~' {
+            InModuleScope WinTop {
+                $t = Limit-WinTopText -Text 'NVIDIA GeForce RTX 4070 Ti SUPER' -MaxWidth 20
+                $t | Should -Be 'NVIDIA GeForce RTX ~'
+                (Get-DisplayWidth -Text $t) | Should -BeLessOrEqual 20
+            }
+        }
+        It 'counts wide CJK characters as two columns' {
+            InModuleScope WinTop {
+                $cjk = (-join ([char[]](0x986F, 0x793A, 0x5361, 0x986F, 0x793A, 0x5361)))   # 6 wide chars = 12 columns
+                $t = Limit-WinTopText -Text $cjk -MaxWidth 7
+                (Get-DisplayWidth -Text $t) | Should -BeLessOrEqual 7
+                $t | Should -Match '~$'
+            }
+        }
+        It 'degrades to just ~ when there is no room' {
+            InModuleScope WinTop {
+                Limit-WinTopText -Text 'GPU' -MaxWidth 0 | Should -Be '~'
+            }
+        }
+    }
+
     Context 'Format-WinTopMemory' {
         It 'uses GiB for GiB-sized capacities' {
             InModuleScope WinTop {
@@ -252,23 +301,29 @@ Describe 'Start-WinTop with GPU support' {
         # The viewport (e.g. "120x36") is whatever Start-WinTop detected: the 36-row fallback when output is redirected (CI),
         # the real window size in an interactive console. Below 36 rows the original layout already overflows, so only assert above that.
         foreach ($view in 'Split', 'Charts', 'Processes') {
-            # Join the raw Write-Host messages: Out-String would re-wrap them at the host width on Windows PowerShell 5.1
-            $text  = (@(Start-WinTop -Count 2 -Interval 0.5 -Language en -View $view -NoMaximize 6>&1 | ForEach-Object { [string]$_ }) -join '') -replace '\x1b\[[0-9;?]*[a-zA-Z]', ''
-            $lines = $text -split "`r?`n"
-            $topLeft = [string][char]0x2554   # box-drawing corner of the header frame (kept out of the file: 5.1 reads BOM-less files as ANSI)
-            $start = @(0..($lines.Count - 1) | Where-Object { $lines[$_] -match ('^' + $topLeft) })[-1]   # last frame's top border
-            $end   = @($start..($lines.Count - 1) | Where-Object { $lines[$_] -match 'Keys:|\[Q/Esc\]' })[0]   # its hotkey bar
-            $lines[$start + 1] | Should -Match '\] (\d+)x(\d+)'
-            $viewportRows = [int]$Matches[2]
-            if ($viewportRows -ge 36) {
-                ($end - $start + 1) | Should -BeLessOrEqual $viewportRows
+            $frame = Get-WinTopFrame -View $view
+            $frame.ViewportMatched | Should -BeTrue -Because "the header of the $view frame prints the viewport size"
+            if ($frame.ViewportRows -ge 36) {
+                $frame.LineCount | Should -BeLessOrEqual $frame.ViewportRows -Because "the $view frame must fit the $($frame.ViewportRows)-row viewport"
             }
         }
     }
-    It 'shows GPU rows only when a GPU is available' -Skip:(-not $machineHasGpu) {
-        $out = (Start-WinTop -Count 2 -Interval 0.5 -Language en -View Charts -NoMaximize 6>&1 | Out-String) -replace '\x1b\[[0-9;?]*[a-zA-Z]', ''
-        $out | Should -Match 'GPU: '
-        $out | Should -Match 'GPU Usage :'
-        $out | Should -Match 'VRAM Usage:'
+    It 'shows the GPU header and gauge rows when a GPU is available and the viewport can hold them' -Skip:(-not $machineHasGpu) {
+        # The layout deliberately hides the GPU rows in a viewport that is too small (Charts view needs up to 28 rows with
+        # a thermal sensor), so only assert presence when the frame reports a viewport that is comfortably tall enough.
+        $frame = Get-WinTopFrame -View Charts
+        $frame.ViewportMatched | Should -BeTrue
+        if ($frame.ViewportRows -ge 36) {
+            $frame.Text | Should -Match 'GPU: '
+            $frame.Text | Should -Match 'GPU Usage :'
+            $frame.Text | Should -Match 'VRAM Usage:'
+        }
+    }
+    It 'keeps the header box rectangular (all box lines the same width)' {
+        # The long-adapter-name case is covered by the Limit-WinTopText unit tests; this checks the real rendered box
+        $frame = Get-WinTopFrame -View Charts
+        $box = @($frame.Text -split "`n" | Select-Object -First 5)   # top border, 2-3 header lines, bottom border
+        $widths = @($box | ForEach-Object { $_.Length } | Select-Object -Unique)
+        $widths.Count | Should -Be 1 -Because 'all header box lines should have the same width'
     }
 }
