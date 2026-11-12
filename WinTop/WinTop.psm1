@@ -22,6 +22,13 @@ namespace WinTop {
         public uint MemoryLoadPct;
     }
 
+    // System-wide CPU times in 100ns units (as returned by GetSystemTimes). Kernel INCLUDES Idle.
+    public struct CpuTimes {
+        public long Idle;
+        public long Kernel;
+        public long User;
+    }
+
     public static class NativeHelper {
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT {
@@ -94,6 +101,45 @@ namespace WinTop {
         private static extern bool GetProcessTimes(IntPtr hProcess, out long creation, out long exit, out long kernel, out long user);
         [DllImport("psapi.dll")]
         private static extern bool GetProcessMemoryInfo(IntPtr hProcess, out PROCESS_MEMORY_COUNTERS counters, uint size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+        [DllImport("powrprof.dll")]
+        private static extern uint CallNtPowerInformation(int informationLevel, IntPtr inputBuffer, uint inputBufferLength, IntPtr outputBuffer, uint outputBufferLength);
+
+        // Whole-system CPU times. Works on every Windows guest/host, unlike the "% Processor Utility"
+        // performance counter which needs APERF/MPERF MSRs that Hyper-V guests commonly do not expose.
+        public static CpuTimes GetCpuTimes() {
+            var t = new CpuTimes();
+            long idle, kernel, user;
+            if (GetSystemTimes(out idle, out kernel, out user)) {
+                t.Idle = idle;
+                t.Kernel = kernel;
+                t.User = user;
+            }
+            return t;
+        }
+
+        // Average current clock (MHz) across logical processors as reported by the OS power manager
+        // (ProcessorInformation, level 11). Returns 0 when unavailable.
+        public static int GetProcessorCurrentMhz() {
+            const int ProcessorInformation = 11;
+            const int EntrySize = 24; // PROCESSOR_POWER_INFORMATION: 6 x ULONG
+            int count = Environment.ProcessorCount;
+            if (count < 1) return 0;
+            IntPtr buf = Marshal.AllocHGlobal(count * EntrySize);
+            try {
+                if (CallNtPowerInformation(ProcessorInformation, IntPtr.Zero, 0, buf, (uint)(count * EntrySize)) != 0) return 0;
+                long sum = 0;
+                int n = 0;
+                for (int i = 0; i < count; i++) {
+                    int cur = Marshal.ReadInt32(buf, i * EntrySize + 8); // CurrentMhz
+                    if (cur > 0) { sum += cur; n++; }
+                }
+                return n > 0 ? (int)(sum / n) : 0;
+            } finally {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
 
         public static MemInfo GetMemoryStatus() {
             var m = new MEMORYSTATUSEX();
@@ -178,6 +224,8 @@ function Get-WinTopStrings {
             ChartTemp    = 'CPU 溫度 ({0})'
             ChartLimit   = '散熱被動降頻限制 (%)'
             TurboHint    = '紫=Turbo > {0}MHz'
+            ClockOsHint  = '系統回報頻率 (無 Turbo 計數器)'
+            ClockEstHint = '推估值: 僅基本頻率'
             ProcSection  = '熱門處理程序 (共 {0} 個程序 | 排序: {1})'
             ProcHeader   = '    PID  程序名稱                      CPU%   CPU 負載條        記憶體 (MB)    MEM%   執行緒'
             Hotkeys      = '快捷鍵: [Q/Esc]離開  [1/A]綜合檢視  [2/C]全圖表  [3/P]全程序表  [S]切換排序(CPU/MEM)  [L]中/英切換'
@@ -209,6 +257,8 @@ function Get-WinTopStrings {
             ChartTemp    = 'CPU Temperature ({0})'
             ChartLimit   = 'Thermal Passive Limit (%)'
             TurboHint    = 'Magenta=Turbo > {0}MHz'
+            ClockOsHint  = 'OS-reported clock, no Turbo counter'
+            ClockEstHint = 'estimated: base clock only'
             ProcSection  = 'Top Processes ({0} total | Sort by: {1})'
             ProcHeader   = '    PID  Process Name                  CPU%   CPU Bar           Memory (MB)    MEM%   Threads'
             Hotkeys      = 'Keys: [Q/Esc]Quit  [1/A]Split View  [2/C]Charts Only  [3/P]Processes Only  [S]Sort(CPU/MEM)  [L]Lang'
@@ -234,6 +284,57 @@ function Get-DisplayWidth {
         }
     }
     return $w
+}
+
+# Busy-time percentage between two NativeHelper.GetCpuTimes() samples (Kernel already includes Idle).
+# Returns $null when no time elapsed between the samples.
+function Get-WinTopCpuLoad {
+    param($Prev, $Cur)
+    $total = ($Cur.Kernel - $Prev.Kernel) + ($Cur.User - $Prev.User)
+    if ($total -le 0) { return $null }
+    $idle = $Cur.Idle - $Prev.Idle
+    return [math]::Max(0.0, [math]::Min(100.0, (1.0 - ($idle / [double]$total)) * 100.0))
+}
+
+# Picks the CPU usage source. "% Processor Utility" is preferred (matches Task Manager), but Hyper-V guests and
+# some other VMs expose the counter yet leave it at 0 forever. When the counter is missing, or keeps reading 0
+# while the OS clearly reports activity for 3 consecutive samples, switch to the GetSystemTimes-based load.
+# $State is a caller-owned hashtable: @{ Streak = 0; UseSystem = $false }.
+function Resolve-WinTopCpuUsage {
+    param(
+        [AllowNull()][object]$CounterValue,
+        [AllowNull()][object]$SystemValue,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+    if ($null -eq $CounterValue) { $State.UseSystem = $true }
+    if (-not $State.UseSystem -and $null -ne $SystemValue -and [double]$CounterValue -le 0.0 -and [double]$SystemValue -ge 1.0) {
+        $State.Streak++
+        if ($State.Streak -ge 3) { $State.UseSystem = $true }
+        return [math]::Max(0.0, [math]::Min(100.0, [double]$SystemValue))
+    }
+    if ($State.UseSystem) {
+        $v = if ($null -ne $SystemValue) { $SystemValue } elseif ($null -ne $CounterValue) { $CounterValue } else { 0.0 }
+        return [math]::Max(0.0, [math]::Min(100.0, [double]$v))
+    }
+    $State.Streak = 0
+    return [math]::Max(0.0, [math]::Min(100.0, [double]$CounterValue))
+}
+
+# Picks the CPU clock source: the "% Processor Performance" counter (scaled from the base clock, can exceed 100
+# for Turbo) -> the OS power manager's CurrentMhz (VMs without APERF/MPERF) -> the base clock as a last resort.
+function Resolve-WinTopClock {
+    param(
+        [double]$Perf,
+        [double]$BaseMHz,
+        [double]$OsMHz
+    )
+    if ($Perf -gt 0) {
+        return [PSCustomObject]@{ Source = 'Counter'; MHz = [math]::Round($BaseMHz * $Perf / 100.0); Perf = $Perf }
+    }
+    if ($OsMHz -gt 0) {
+        return [PSCustomObject]@{ Source = 'OS'; MHz = [math]::Round($OsMHz); Perf = $OsMHz * 100.0 / $BaseMHz }
+    }
+    return [PSCustomObject]@{ Source = 'Est'; MHz = [math]::Round($BaseMHz); Perf = 100.0 }
 }
 
 <#
@@ -328,6 +429,10 @@ function Start-WinTop {
         $null = $cntUtil.NextValue()
         if ($cntPerf) { $null = $cntPerf.NextValue() }
     } catch {}
+
+    # Fallback CPU usage source (GetSystemTimes) for guests where the Processor Utility counter is missing or stuck at 0
+    $prevCpuTimes  = [WinTop.NativeHelper]::GetCpuTimes()
+    $cpuUsageState = @{ Streak = 0; UseSystem = (-not $cntUtil) }
 
     $hasThermal = $false
     try {
@@ -569,9 +674,17 @@ function Start-WinTop {
             $ui = Get-WinTopStrings -Lang $activeLang
 
             # 1. Sample CPU, Memory, Thermal counters (<10ms)
-            $usage = if ($cntUtil) { [math]::Max(0.0, [math]::Min(100.0, [double]$cntUtil.NextValue())) } else { 0.0 }
-            $perf  = if ($cntPerf) { [double]$cntPerf.NextValue() } else { $usage }
-            $mhz   = [math]::Round($baseMHz * $perf / 100.0)
+            $curCpuTimes = [WinTop.NativeHelper]::GetCpuTimes()
+            $sysLoad     = Get-WinTopCpuLoad -Prev $prevCpuTimes -Cur $curCpuTimes
+            $prevCpuTimes = $curCpuTimes
+            $ctrUsage = if ($cntUtil) { [double]$cntUtil.NextValue() } else { $null }
+            $usage    = Resolve-WinTopCpuUsage -CounterValue $ctrUsage -SystemValue $sysLoad -State $cpuUsageState
+
+            $ctrPerf = if ($cntPerf) { [double]$cntPerf.NextValue() } else { 0.0 }
+            $osMHz   = if ($ctrPerf -gt 0) { 0 } else { [WinTop.NativeHelper]::GetProcessorCurrentMhz() }
+            $clock   = Resolve-WinTopClock -Perf $ctrPerf -BaseMHz $baseMHz -OsMHz $osMHz
+            $perf    = $clock.Perf
+            $mhz     = $clock.MHz
             $tempC = if ($hasThermal -and $cntTemp) { [math]::Max(0.0, [double]$cntTemp.NextValue() - 273.15) } else { 0.0 }
             $limit = if ($hasThermal -and $cntLimit) { [double]$cntLimit.NextValue() } else { 100.0 }
 
@@ -714,7 +827,11 @@ function Start-WinTop {
             [void]$out.AppendLine("${cCyan}${cBold}${boxBL}${dblHr}${boxBR}${cReset}${clr}")
 
             # Top Summary Gauges
-            $turboTag = if ($perf -gt 100) { "${cMagenta}[Turbo]${cReset}" } else { "${cGray}[Base] ${cReset}" }
+            $turboTag = switch ($clock.Source) {
+                'OS'    { "${cGray}[OS]   ${cReset}" }
+                'Est'   { "${cGray}[Est]  ${cReset}" }
+                default { if ($perf -gt 100) { "${cMagenta}[Turbo]${cReset}" } else { "${cGray}[Base] ${cReset}" } }
+            }
             $memTag   = ("{0,4:N1}/{1:N0}G" -f $usedGB, $totalGB)
             $padU = [string]::new(' ', [math]::Max(1, 10 - $dltUsage.Width))
             $padM = [string]::new(' ', [math]::Max(1, 10 - $dltMHz.Width))
@@ -775,7 +892,11 @@ function Start-WinTop {
                     [void]$out.AppendLine($ln)
                 }
 
-                $turboHintStr = $ui.TurboHint -f $baseMHz
+                $turboHintStr = switch ($clock.Source) {
+                    'OS'    { $ui.ClockOsHint }
+                    'Est'   { $ui.ClockEstHint }
+                    default { $ui.TurboHint -f $baseMHz }
+                }
                 [void]$out.AppendLine(" ${cBold}2. $($ui.ChartClock)${cReset}  ${cGray}${stsMHz} (${turboHintStr})${cReset}${clr}")
                 foreach ($ln in (& $newMultiRowChart $bktMHz $minMHzScale $maxMHzScale $rMHz '0' 'M' { param($v) if ($v -gt $baseMHz) { $cMagenta } else { $cCyan } } $clr)) {
                     [void]$out.AppendLine($ln)
