@@ -322,7 +322,12 @@ Describe 'Start-WinTop with GPU support' {
     It 'keeps the header box rectangular (all box lines the same width)' {
         # The long-adapter-name case is covered by the Limit-WinTopText unit tests; this checks the real rendered box
         $frame = Get-WinTopFrame -View Charts
-        $box = @($frame.Text -split "`n" | Select-Object -First 5)   # top border, 2-3 header lines, bottom border
+        # The box runs from the top border to the bottom border: 4 lines without a GPU, 5 with one (box-drawing corners built from code points, see Get-WinTopFrame)
+        $frameLines = @($frame.Text -split "`n")
+        $bottom = [string][char]0x255A
+        $bottomIdx = @(0..($frameLines.Count - 1) | Where-Object { $frameLines[$_] -match ('^' + $bottom) })[0]
+        $bottomIdx | Should -Not -BeNullOrEmpty
+        $box = @($frameLines[0..$bottomIdx])
         $widths = @($box | ForEach-Object { $_.Length } | Select-Object -Unique)
         $widths.Count | Should -Be 1 -Because 'all header box lines should have the same width'
     }
