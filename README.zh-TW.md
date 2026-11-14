@@ -69,6 +69,15 @@ top -View Processes -SortBy MEM
 
 ---
 
+## 在虛擬機器中執行 (Hyper-V 等)
+
+許多虛擬化平台（尤其是 Hyper-V 客體）不會提供 `% Processor Utility` / `% Processor Performance` 背後所需的 CPU 計數器，導致數值永遠為 `0`。WinTop 會自動偵測並改用替代來源：
+
+- **CPU 使用率**：改用作業系統以閒置時間為基礎的 `% Processor Time` 計數器（涵蓋所有處理器群組）；若該計數器也無法使用，再改用 `GetSystemTimes` 的 kernel / user / idle 時間計算。
+- **CPU 頻率**：改用作業系統電源管理員回報的頻率並標示 **`[OS]`**；若仍無法取得，則顯示基本頻率並標示 **`[Est]`**。虛擬機器客體通常看不到 Turbo 或 P-state 變化，因此該數值多半固定不變。
+
+---
+
 ## GPU 監控說明
 
 - 需要 WDDM 2.0 以上的 `GPU Engine` / `GPU Adapter Memory` 效能計數器（Windows 10 1709 以上並搭配 WDDM 2.x 驅動程式）；若不支援，GPU 欄位會直接不顯示。

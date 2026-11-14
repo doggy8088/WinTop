@@ -75,6 +75,13 @@ top -View Processes -SortBy MEM
 - **PowerShell**: Windows PowerShell 5.1 or PowerShell 7+ (`pwsh`)
 - **Terminal**: Windows Terminal (recommended), VS Code Integrated Terminal, or Console Host
 
+### Running inside a virtual machine (Hyper-V, etc.)
+
+Many hypervisors (notably Hyper-V guests) do not expose the CPU counters behind `% Processor Utility` / `% Processor Performance`, so they read a constant `0`. WinTop detects this automatically:
+
+- **CPU usage** falls back to the OS idle-time based `% Processor Time` counter (which aggregates all processor groups) and, if that is unavailable too, to the kernel/user/idle times from `GetSystemTimes`.
+- **CPU clock** falls back to the clock reported by the OS power manager, tagged **`[OS]`**; if even that is unavailable it shows the base clock tagged **`[Est]`**. VM guests usually cannot see Turbo or P-state changes, so this value is typically constant.
+
 ### GPU monitoring notes
 
 - Needs the WDDM 2.0+ `GPU Engine` / `GPU Adapter Memory` performance counters (Windows 10 version 1709 or later with a WDDM 2.x driver). Without them the GPU rows are simply not shown.
