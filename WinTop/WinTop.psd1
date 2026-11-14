@@ -1,6 +1,6 @@
 ﻿@{
     RootModule           = 'WinTop.psm1'
-    ModuleVersion        = '0.1.0'
+    ModuleVersion        = '0.2.0'
     CompatiblePSEditions = @('Desktop', 'Core')
     GUID                 = '8a9e4d21-6c3b-4f19-9b72-5e84d1a0c3f7'
     Author               = 'Will 保哥'
@@ -23,7 +23,7 @@
             )
             LicenseUri   = 'https://github.com/doggy8088/WinTop/blob/main/LICENSE'
             ProjectUri   = 'https://github.com/doggy8088/WinTop'
-            ReleaseNotes = 'v0.1.0 - Initial release: responsive full-screen TUI system monitor ("top" for Windows) with 5-minute trend charts, CPU/Turbo/Memory/Thermal gauges, live top processes, interactive hotkeys, and auto-detected English / Traditional Chinese UI.'
+            ReleaseNotes = 'v0.2.0 - Added vendor-neutral GPU usage & VRAM monitoring (NVIDIA / AMD / Intel) with multi-GPU switching (G), and OS/GetSystemTimes CPU usage & clock fallbacks for Hyper-V and VM guests.'
         }
     }
 }
